@@ -16,14 +16,19 @@ from fastapi.responses import HTMLResponse, FileResponse
 from web_templates import _render
 
 from config import (
-    VERSION, YTWEB, DOWNLOAD_PATH, DST_PATH, LOG_FILE,
-    ID_LOG_FILE, CHANNEL_IDS_FILE, MAX_DOWNLOADS_PER_RUN,
-    SLEEP_INTERVAL, LOGS_DIR
+    VERSION, YTWEB, DOWNLOAD_PATH, DST_PATH,
+    CHANNEL_IDS_FILE, MAX_DOWNLOADS_PER_RUN, SLEEP_INTERVAL
 )
 from fetcher import get_playlist_info
 from downloader import download_video
 from mover import chagname, move_files
-from logger import RunLogger, write_csv_row
+from logger import RunLogger
+from database import (
+    get_all_videos, get_downloaded_ids, get_stats,
+    get_recent_logs, log_download, is_downloaded,
+    upsert_video, update_video_category, get_pending_videos,
+    get_download_history, app_log, migrate_from_csv
+)
 from utils import format_duration
 
 # ============ 全局状态 ============
@@ -50,6 +55,7 @@ def _log(msg: str):
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """应用生命周期"""
+    migrate_from_csv()
     _log(f"Web UI 启动 v{VERSION}")
     yield
     _log("Web UI 关闭")
@@ -59,36 +65,12 @@ app = FastAPI(title="BabyBus 下载器", version=VERSION, lifespan=lifespan)
 # ============ 辅助函数 ============
 
 def load_downloaded_ids() -> set:
-    """加载已下载的 ID 集合"""
-    if not os.path.exists(ID_LOG_FILE):
-        return set()
-    try:
-        with open(ID_LOG_FILE, 'r', encoding='utf-8') as f:
-            return set(line.strip() for line in f if line.strip())
-    except:
-        return set()
+    """加载已下载的 ID 集合（从 SQLite）"""
+    return get_downloaded_ids()
 
 def load_channel_data() -> list:
-    """加载频道视频列表"""
-    if not os.path.exists(CHANNEL_IDS_FILE):
-        return []
-    videos = []
-    try:
-        with open(CHANNEL_IDS_FILE, 'r', encoding='utf-8') as f:
-            next(f, None)  # skip header
-            for line in f:
-                parts = line.strip().split(',')
-                if len(parts) >= 5:
-                    videos.append({
-                        "id": parts[0],
-                        "title": parts[1].strip('"'),
-                        "upload_date": parts[2],
-                        "duration_fmt": parts[3],
-                        "duration_sec": parts[4],
-                    })
-    except Exception as e:
-        _log(f"加载频道数据失败: {e}")
-    return videos
+    """加载频道视频列表（从 SQLite）"""
+    return get_all_videos()
 
 def get_output_files() -> list:
     """获取 output 目录文件列表"""
@@ -135,9 +117,12 @@ async def run_download_task(video_id: Optional[str] = None):
                 chagname(DOWNLOAD_PATH, run_logger)
                 move_files(DOWNLOAD_PATH, DST_PATH, channel_file=CHANNEL_IDS_FILE)
                 _log("重命名和移动完成")
+                fname = os.path.basename(filepath)
+                log_download(video_id, video_id, "", "N/A", size_mb, fname, status="ok")
                 _app_state["last_result"] = {"success": True, "video_id": video_id, "size_mb": size_mb}
             else:
                 _log(f"下载失败: {video_id}")
+                log_download(video_id, video_id, "", "N/A", 0.0, "", status="failed")
                 _app_state["last_result"] = {"success": False, "video_id": video_id, "error": "下载失败"}
         else:
             # 频道扫描（简化版，只下载 1 个测试）
@@ -156,8 +141,13 @@ async def run_download_task(video_id: Optional[str] = None):
                 if rc == 0:
                     chagname(DOWNLOAD_PATH, run_logger)
                     move_files(DOWNLOAD_PATH, DST_PATH, channel_file=CHANNEL_IDS_FILE)
+                    fname = os.path.basename(filepath)
+                    log_download(v["id"], v["title"], v.get("upload_date",""),
+                                 v.get("duration",""), size_mb, fname, status="ok")
                     _app_state["last_result"] = {"success": True, "video_id": v["id"], "title": v["title"][:50]}
                 else:
+                    log_download(v["id"], v["title"], v.get("upload_date",""),
+                                 v.get("duration",""), 0.0, "", status="failed")
                     _app_state["last_result"] = {"success": False, "error": "下载失败"}
             else:
                 _log("没有新视频")
@@ -177,26 +167,9 @@ async def run_download_task(video_id: Optional[str] = None):
 @app.get("/", response_class=HTMLResponse)
 async def index(request: Request):
     """首页仪表盘"""
-    downloaded_ids = load_downloaded_ids()
-    channel_data = load_channel_data()
+    stats = get_stats()
     output_files = get_output_files()
-    
-    # 统计（跳过 NA 或空值）
-    def _is_short(v):
-        ds = v.get("duration_sec", "")
-        try:
-            return float(ds) < 180
-        except (ValueError, TypeError):
-            return False
-    short_videos = [v for v in channel_data if _is_short(v)]
-    
-    stats = {
-        "total_videos": len(channel_data),
-        "downloaded": len(downloaded_ids),
-        "pending": len(channel_data) - len(downloaded_ids),
-        "output_files": len(output_files),
-        "short_videos": len(short_videos),
-    }
+    stats["output_files"] = len(output_files)
     
     return HTMLResponse(_render("index.html", {
         "version": VERSION,
@@ -212,17 +185,17 @@ async def index(request: Request):
 @app.get("/videos", response_class=HTMLResponse)
 async def videos_page(request: Request, filter: str = "all"):
     """视频列表页"""
-    downloaded_ids = load_downloaded_ids()
     channel_data = load_channel_data()
     
     videos = []
     for v in channel_data:
-        vid = v["id"]
-        is_downloaded = vid in downloaded_ids
-        try:
-            duration_sec = float(v.get("duration_sec", 0)) if v.get("duration_sec") else 0
-        except (ValueError, TypeError):
-            duration_sec = 0
+        is_downloaded = bool(v.get("downloaded"))
+        duration_sec = v.get("duration_sec") or 0
+        if duration_sec:
+            try:
+                duration_sec = float(duration_sec)
+            except (ValueError, TypeError):
+                duration_sec = 0
         
         if filter == "downloaded" and not is_downloaded:
             continue
@@ -234,7 +207,7 @@ async def videos_page(request: Request, filter: str = "all"):
         videos.append({
             **v,
             "downloaded": is_downloaded,
-            "is_short": duration_sec < 180,
+            "is_short": bool(duration_sec < 180),
         })
     
     return HTMLResponse(_render("videos.html", {
@@ -258,14 +231,18 @@ async def files_page(request: Request):
 @app.get("/logs", response_class=HTMLResponse)
 async def logs_page(request: Request):
     """日志页"""
+    db_logs = get_recent_logs()
+    all_logs = db_logs if db_logs else _app_state["logs"]
     return HTMLResponse(_render("logs.html", {
-        "logs": _app_state["logs"],
+        "logs": all_logs,
     }))
 
 @app.get("/api/logs")
 async def api_logs():
     """API: 获取日志"""
-    return {"logs": _app_state["logs"], "running": _app_state["running"]}
+    db_logs = get_recent_logs()
+    return {"logs": db_logs if db_logs else _app_state["logs"],
+            "running": _app_state["running"]}
 
 @app.post("/api/download")
 async def api_download(video_id: str = Form(...)):
@@ -328,15 +305,10 @@ def _scheduler_loop():
                 _time.sleep(SLEEP_INTERVAL)
                 continue
             
-            # 2. 加载历史 + 对比
+            # 2. 加载历史 + 对比（从 DB）
             prev_map = {}
-            if os.path.exists(CHANNEL_IDS_FILE):
-                with open(CHANNEL_IDS_FILE, 'r', encoding='utf-8') as f:
-                    next(f, None)
-                    for line in f:
-                        parts = line.strip().split(',')
-                        if len(parts) >= 5 and parts[0]:
-                            prev_map[parts[0]] = parts[1]
+            for row in get_all_videos():
+                prev_map[row["id"]] = row.get("title") or ""
             
             new_map = {v["id"]: v for v in playlist}
             new_ids = set(new_map.keys()) - set(prev_map.keys())
@@ -346,22 +318,14 @@ def _scheduler_loop():
             else:
                 _log("没有新视频")
             
-            # 3. 保存快照
-            with open(CHANNEL_IDS_FILE, 'w', encoding='utf-8') as f:
-                f.write("id,title,upload_date,duration_fmt,duration_sec\n")
-                for v in playlist:
-                    from utils import format_duration as _fd
-                    dur = _fd(v["duration"])
-                    title = v["title"].replace('"', '""')
-                    f.write(f'{v["id"]},"{title}",{v["upload_date"]},{dur},{v["duration"]}\n')
+            # 3. 保存快照到 DB
+            for v in playlist:
+                dur_fmt = format_duration(v["duration"])
+                dur_sec = v.get("duration") or 0
+                upsert_video(v["id"], v["title"], v.get("upload_date",""),
+                             dur_fmt, float(dur_sec))
             
             # 4. 增量下载
-            if os.path.exists(ID_LOG_FILE):
-                with open(ID_LOG_FILE, 'r', encoding='utf-8') as f:
-                    downloaded_ids = set(line.strip() for line in f if line.strip())
-            else:
-                downloaded_ids = set()
-            
             download_count = 0
             for v in playlist:
                 if download_count >= MAX_DOWNLOADS_PER_RUN:
@@ -369,21 +333,17 @@ def _scheduler_loop():
                     break
                 
                 vid = v["id"]
-                if vid in downloaded_ids:
+                if is_downloaded(vid):
                     continue
                 
                 _log(f"开始下载: {vid} | {v['title'][:50]}")
                 rc, filepath, size_mb = download_video(vid, DOWNLOAD_PATH, run_logger)
                 
                 if rc == 0:
-                    downloaded_ids.add(vid)
-                    with open(ID_LOG_FILE, 'w', encoding='utf-8') as idf:
-                        idf.write('\n'.join(downloaded_ids))
-                    
                     fname = os.path.basename(filepath)
-                    ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-                    from logger import write_csv_row as _wcr
-                    _wcr(LOG_FILE, f'{ts},{vid},"{v["title"][:60]}",{v["upload_date"]},{_fd(v["duration"])},{size_mb:.2f},{fname}')
+                    dur_fmt = format_duration(v.get("duration") or 0)
+                    log_download(vid, v["title"], v.get("upload_date",""),
+                                dur_fmt, size_mb, fname, status="ok")
                     
                     # 重命名 + 移动
                     chagname(DOWNLOAD_PATH, run_logger)
@@ -392,6 +352,8 @@ def _scheduler_loop():
                     _app_state["last_result"] = {"success": True, "video_id": vid, "size_mb": size_mb}
                 else:
                     _log(f"下载失败: {vid}")
+                    log_download(vid, v["title"], v.get("upload_date",""),
+                               "FAILED", 0.0, "", status="failed")
                     _app_state["last_result"] = {"success": False, "video_id": vid, "error": "下载失败"}
             
             _log("本次执行完成")

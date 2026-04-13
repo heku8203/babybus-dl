@@ -6,7 +6,7 @@ BabyBus 下载器 — 配置模块
 import os
 import platform
 
-VERSION = "0.5"
+VERSION = "0.6"
 
 # ===== subprocess 编码（Windows=GBK, Linux=UTF-8） =====
 SUBPROCESS_ENCODING = 'gbk' if platform.system() == 'Windows' else 'utf-8'
@@ -31,6 +31,7 @@ DST_PATH = os.environ.get('DST_PATH',
 LOG_FILE = os.path.join(LOGS_DIR, 'logs.csv')
 ID_LOG_FILE = os.path.join(LOGS_DIR, 'id_download_log.csv')
 CHANNEL_IDS_FILE = os.path.join(LOGS_DIR, 'channel_ids_latest.txt')
+DB_PATH = os.path.join(LOGS_DIR, 'app.db')
 
 # 每次运行最多下载视频数
 MAX_DOWNLOADS_PER_RUN = 3

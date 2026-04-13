@@ -14,7 +14,7 @@ RUN pip install --no-cache-dir yt-dlp fastapi uvicorn jinja2 python-multipart -i
 
 WORKDIR /app
 
-COPY config.py fetcher.py downloader.py mover.py utils.py logger.py main.py web.py web_templates.py ./
+COPY config.py fetcher.py downloader.py mover.py utils.py logger.py main.py web.py web_templates.py database.py ./
 
 # yt-dlp 指定 node 运行时 + iOS 客户端绕过容器限制
 RUN mkdir -p /root/.config/yt-dlp && \

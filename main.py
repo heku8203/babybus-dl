@@ -10,14 +10,17 @@ import time
 import signal
 import platform
 
-from config import (YTWEB, DOWNLOAD_PATH, DST_PATH, LOG_FILE,
-                    ID_LOG_FILE, CHANNEL_IDS_FILE, MAX_DOWNLOADS_PER_RUN,
+from config import (YTWEB, DOWNLOAD_PATH, DST_PATH,
+                    CHANNEL_IDS_FILE, MAX_DOWNLOADS_PER_RUN,
                     SLEEP_INTERVAL, VERSION)
 from fetcher import get_playlist_info
 from downloader import download_video
 from mover import chagname, move_files
-from logger import RunLogger, write_csv_row
+from logger import RunLogger
 from utils import format_duration
+from database import (
+    is_downloaded, upsert_video, log_download, migrate_from_csv, get_all_videos
+)
 
 # ===== 优雅退出 =====
 _running = True
@@ -29,23 +32,6 @@ def _signal_handler(sig, frame):
 
 signal.signal(signal.SIGTERM, _signal_handler)
 signal.signal(signal.SIGINT, _signal_handler)
-
-
-def load_prev_ids():
-    """加载上一轮频道视频 ID 映射"""
-    prev_map = {}
-    if os.path.exists(CHANNEL_IDS_FILE):
-        with open(CHANNEL_IDS_FILE, 'r', encoding='utf-8') as f:
-            next(f, None)
-            for line in f:
-                parts = line.strip().split(',')
-                if len(parts) >= 1 and parts[0]:
-                    prev_map[parts[0]] = {
-                        "title": parts[1] if len(parts) > 1 else "",
-                        "upload_date": parts[2] if len(parts) > 2 else "",
-                        "duration": parts[4] if len(parts) > 4 else "",
-                    }
-    return prev_map
 
 
 def compare_channel(prev_map, new_map, run_logger):
@@ -83,13 +69,12 @@ def compare_channel(prev_map, new_map, run_logger):
 
 
 def save_channel_snapshot(playlist):
-    """保存频道视频列表快照到 CSV"""
-    with open(CHANNEL_IDS_FILE, 'w', encoding='utf-8') as f:
-        f.write("id,title,upload_date,duration_fmt,duration_sec\n")
-        for v in playlist:
-            dur = format_duration(v["duration"])
-            title = v["title"].replace('"', '""')
-            f.write(f"{v['id']},\"{title}\",{v['upload_date']},{dur},{v['duration']}\n")
+    """保存频道视频列表快照到 SQLite"""
+    for v in playlist:
+        dur_fmt = format_duration(v["duration"])
+        dur_sec = v.get("duration", 0) or 0
+        upsert_video(v["id"], v["title"], v.get("upload_date",""),
+                     dur_fmt, float(dur_sec))
 
 
 def run_once():
@@ -106,21 +91,21 @@ def run_once():
     # 1. 获取频道视频列表
     playlist = get_playlist_info(YTWEB, run_logger)
 
-    # 2. 对比频道历史
-    prev_map = load_prev_ids()
+    # 2. 对比频道历史（从 DB 读上轮快照）
+    prev_map = {}
+    for row in get_all_videos():
+        prev_map[row["id"]] = {
+            "title": row.get("title") or "",
+            "upload_date": row.get("upload_date") or "",
+            "duration": row.get("duration_sec") or 0,
+        }
     new_map = {v["id"]: v for v in playlist}
     compare_channel(prev_map, new_map, run_logger)
 
-    # 3. 保存快照
+    # 3. 保存快照到 DB
     save_channel_snapshot(playlist)
 
     # 4. 增量下载
-    if os.path.exists(ID_LOG_FILE):
-        with open(ID_LOG_FILE, 'r', encoding='UTF-8') as f:
-            loclist = f.read().split()
-    else:
-        loclist = []
-
     downloaded_count = 0
 
     for v in playlist:
@@ -130,32 +115,27 @@ def run_once():
             break
 
         vid = v["id"]
-        title_short = v["title"][:60] if v["title"] else ""
-        if vid in loclist:
+        if is_downloaded(vid):
             print(f"已下载，跳过: {vid}")
             continue
 
         ts = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime())
+        title_short = v["title"][:60] if v["title"] else ""
         print(f"开始下载: {vid} | {title_short}")
         run_logger.log(vid)
 
         rc, filepath, size_mb = download_video(vid, DOWNLOAD_PATH, run_logger)
         if rc == 0:
-            loclist.append(vid)
             downloaded_count += 1
-            with open(ID_LOG_FILE, 'w', encoding='UTF-8') as idf:
-                idf.write('\n'.join(loclist))
             print('本地数据已更新')
             run_logger.log('已下载')
             fname = os.path.basename(filepath)
-            title_csv = title_short.replace('"', '""')
             dur_fmt = format_duration(v["duration"])
-            write_csv_row(LOG_FILE,
-                f"{ts},{vid},\"{title_csv}\",{v['upload_date']},{dur_fmt},{size_mb:.2f},{fname}")
+            log_download(vid, title_short, v.get("upload_date",""),
+                        dur_fmt, size_mb, fname, status="ok")
         else:
-            title_csv = title_short.replace('"', '""')
-            write_csv_row(LOG_FILE,
-                f"{ts},{vid},\"{title_csv}\",{v['upload_date']},FAILED,0,")
+            log_download(vid, title_short, v.get("upload_date",""),
+                        "FAILED", 0.0, "", status="failed")
 
     # 5. 重命名 + 分类移动（传入 channel_file 做智能分类）
     chagname(DOWNLOAD_PATH, run_logger)
@@ -199,6 +179,7 @@ if __name__ == '__main__':
     print(f"BabyBus 下载器 v{VERSION}")
     print(f"定时间隔: {SLEEP_INTERVAL}s ({SLEEP_INTERVAL // 3600}h)")
     print(f"PID: {os.getpid()}")
+    migrate_from_csv()
     print()
 
     # 检查命令行参数

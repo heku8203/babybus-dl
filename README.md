@@ -1,4 +1,4 @@
-# BabyBus 下载器 v0.5
+# BabyBus 下载器 v0.6
 
 批量下载 BabyBus YouTube 频道视频，自动重命名、智能分类整理，支持 Web UI 管理。
 
@@ -112,20 +112,29 @@ BabyBus下载器/
 ├── main.py
 ├── web.py
 ├── web_templates.py
+├── database.py              # SQLite 数据库封装
 ├── Dockerfile
 ├── docker-compose.yml
 ├── .gitignore
 ├── README.md
-├── logs/                    # 运行日志
-│   ├── logs.csv
-│   ├── id_download_log.csv
-│   └── channel_ids_latest.txt
+├── logs/                    # 日志和数据
+│   ├── app.db               # SQLite 数据库
+│   └── logs.csv             # 历史日志（已废弃，内容已迁移至 app.db）
 └── output/                  # Docker 输出目录（映射到本地 downloads/）
 ```
 
 > 本地开发时视频存放在 `downloads/` 目录，Docker 模式下存放在 `output/` 目录。
+> 日志数据已迁移至 `logs/app.db`（SQLite），无需手动管理 CSV 文件。
 
 ## 更新日志
+
+### v0.6 (2026-04-13)
+- SQLite 数据库替代 CSV 日志（logs.csv、id_download_log.csv、channel_ids_latest.txt）
+- 新增 `database.py`：videos / downloads / runs / app_log 四张表，WAL 模式
+- 迁移脚本：启动时自动将已有 CSV 数据导入 SQLite（幂等）
+- Web UI 查询全部走数据库，并发安全，无文件锁问题
+- 频道对比、增量下载逻辑统一使用 DB 函数
+- 新增 `get_stats()` / `get_recent_logs()` / `get_pending_videos()` 等 DB 接口
 
 ### v0.5 (2026-04-13)
 - 新增 Web UI（FastAPI）：仪表盘 / 视频列表 / 文件管理 / 实时日志

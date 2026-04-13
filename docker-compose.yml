@@ -1,6 +1,6 @@
 services:
   babybus-dl:
-    image: babybus-dl:v0.5
+    image: babybus-dl:v0.6
     container_name: babybus-dl
     restart: unless-stopped
     network_mode: bridge
