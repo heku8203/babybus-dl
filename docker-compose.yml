@@ -1,0 +1,14 @@
+services:
+  babybus-dl:
+    image: babybus-dl:v0.5
+    container_name: babybus-dl
+    restart: unless-stopped
+    network_mode: bridge
+    ports:
+      - "8080:8080"
+    volumes:
+      - ./logs:/app/logs
+      - ./output:/output
+    environment:
+      - SLEEP_INTERVAL=21600
+      - MAX_DOWNLOADS_PER_RUN=3
